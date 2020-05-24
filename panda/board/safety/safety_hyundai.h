@@ -6,15 +6,15 @@ const int HYUNDAI_MAX_RATE_DOWN = 7;
 const int HYUNDAI_DRIVER_TORQUE_ALLOWANCE = 50;
 const int HYUNDAI_DRIVER_TORQUE_FACTOR = 2;
 const int HYUNDAI_STANDSTILL_THRSLD = 30;  // ~1kph
-const AddrBus HYUNDAI_TX_MSGS[] = {{832, 0}, {1265, 0}, {1157, 0}};
+const CanMsg HYUNDAI_TX_MSGS[] = {{832, 0, 8}, {1265, 0, 4}, {1157, 0, 4}};
 
 // TODO: do checksum checks
 AddrCheckStruct hyundai_rx_checks[] = {
-  {.addr = {608}, .bus = 0, .max_counter = 3U, .expected_timestep = 10000U},
-  {.addr = {897}, .bus = 0, .max_counter = 255U, .expected_timestep = 10000U},
-  {.addr = {902}, .bus = 0, .max_counter = 3U,  .expected_timestep = 10000U},
-  {.addr = {916}, .bus = 0, .max_counter = 7U, .expected_timestep = 10000U},
-  {.addr = {1057}, .bus = 0, .max_counter = 15U, .expected_timestep = 20000U},
+  {.msg = {{608, 0, 8}}, .check_checksum = true, .max_counter = 3U, .expected_timestep = 10000U},
+  {.msg = {{897, 0, 8}}, .max_counter = 255U, .expected_timestep = 10000U},
+  {.msg = {{902, 0, 8}}, .max_counter = 15U,  .expected_timestep = 10000U},
+  {.msg = {{916, 0, 8}}, .check_checksum = true, .max_counter = 7U, .expected_timestep = 10000U},
+  {.msg = {{1057, 0, 8}}, .check_checksum = true, .max_counter = 15U, .expected_timestep = 20000U},
 };
 const int HYUNDAI_RX_CHECK_LEN = sizeof(hyundai_rx_checks) / sizeof(hyundai_rx_checks[0]);
 
@@ -27,7 +27,7 @@ static uint8_t hyundai_get_counter(CAN_FIFOMailBox_TypeDef *to_push) {
   } else if (addr == 897) {
     cnt = GET_BYTE(to_push, 5);
   } else if (addr == 902) {
-    cnt = (GET_BYTE(to_push, 1) >> 6) & 0x3;
+    cnt = ((GET_BYTE(to_push, 3) >> 6) << 2) | (GET_BYTE(to_push, 1) >> 6);
   } else if (addr == 916) {
     cnt = (GET_BYTE(to_push, 1) >> 5) & 0x7;
   } else if (addr == 1057) {
@@ -38,10 +38,43 @@ static uint8_t hyundai_get_counter(CAN_FIFOMailBox_TypeDef *to_push) {
   return cnt;
 }
 
+static uint8_t hyundai_get_checksum(CAN_FIFOMailBox_TypeDef *to_push) {
+  int addr = GET_ADDR(to_push);
+
+  uint8_t chksum;
+  if (addr == 608) {
+    chksum = GET_BYTE(to_push, 7) & 0xF;
+  } else if (addr == 916) {
+    chksum = GET_BYTE(to_push, 6) & 0xF;
+  } else if (addr == 1057) {
+    chksum = GET_BYTE(to_push, 7) >> 4;
+  } else {
+    chksum = 0;
+  }
+  return chksum;
+}
+
+static uint8_t hyundai_compute_checksum(CAN_FIFOMailBox_TypeDef *to_push) {
+  int addr = GET_ADDR(to_push);
+
+  uint8_t chksum = 0;
+  // same algorithm, but checksum is in a different place
+  for (int i = 0; i < 8; i++) {
+    uint8_t b = GET_BYTE(to_push, i);
+    if (((addr == 608) && (i == 7)) || ((addr == 916) && (i == 6)) || ((addr == 1057) && (i == 7))) {
+      b &= (addr == 1057) ? 0x0FU : 0xF0U; // remove checksum
+    }
+    chksum += (b % 16U) + (b / 16U);
+  }
+  chksum = (16U - (chksum %  16U)) % 16U;
+  return chksum;
+}
+
 static int hyundai_rx_hook(CAN_FIFOMailBox_TypeDef *to_push) {
 
   bool valid = addr_safety_check(to_push, hyundai_rx_checks, HYUNDAI_RX_CHECK_LEN,
-                                 NULL, NULL, hyundai_get_counter);
+                                 hyundai_get_checksum, hyundai_compute_checksum,
+                                 hyundai_get_counter);
 
   bool unsafe_allow_gas = unsafe_mode & UNSAFE_DISABLE_DISENGAGE_ON_GAS;
 
@@ -106,9 +139,8 @@ static int hyundai_tx_hook(CAN_FIFOMailBox_TypeDef *to_send) {
 
   int tx = 1;
   int addr = GET_ADDR(to_send);
-  int bus = GET_BUS(to_send);
 
-  if (!msg_allowed(addr, bus, HYUNDAI_TX_MSGS, sizeof(HYUNDAI_TX_MSGS)/sizeof(HYUNDAI_TX_MSGS[0]))) {
+  if (!msg_allowed(to_send, HYUNDAI_TX_MSGS, sizeof(HYUNDAI_TX_MSGS)/sizeof(HYUNDAI_TX_MSGS[0]))) {
     tx = 0;
   }
 
@@ -191,7 +223,6 @@ static int hyundai_fwd_hook(int bus_num, CAN_FIFOMailBox_TypeDef *to_fwd) {
   }
   return bus_fwd;
 }
-
 
 const safety_hooks hyundai_hooks = {
   .init = nooutput_init,
